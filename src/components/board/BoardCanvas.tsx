@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react'
 import type { Drawing, DrawingType, Point, SelectionRef } from '../../types'
 import {
@@ -23,7 +23,6 @@ import { SelectionOverlay } from './SelectionOverlay'
 import { TextInputDialog } from '../TextInputDialog'
 
 type Gesture =
-  | { kind: 'pan'; lastX: number; lastY: number }
   | { kind: 'pinch'; startDist: number; startZoom: number; startMid: Point; startPan: Point }
   | { kind: 'move'; ref: SelectionRef; last: Point }
   | { kind: 'endpoint'; ref: SelectionRef; which: 'start' | 'end' }
@@ -57,15 +56,29 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
 
   const interactive = tool === 'select' || tool === 'eraser'
 
-  /** クライアント座標 → viewBox 座標 */
+  /**
+   * クライアント座標 → viewBox 座標。
+   *
+   * 以前は `getScreenCTM()` を使っていたが、一部のモバイルブラウザでは
+   * レイアウト直後などに一時的に null を返すことがあり、その際の
+   * フォールバック（0,0）に座標が飛ぶことで「配球を押すと左上にカーソルが
+   * 行ってしまう」ような不具合につながっていた。
+   * `getBoundingClientRect()` は null を返さないため、こちらを使い
+   * `preserveAspectRatio="xMidYMid meet"` のレターボックス分を自前で計算する。
+   */
   const clientToView = useCallback(
     (clientX: number, clientY: number): Point => {
       const svg = svgRef.current
       if (!svg) return { x: 0, y: 0 }
-      const ctm = svg.getScreenCTM()
-      if (!ctm) return { x: 0, y: 0 }
-      const p = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse())
-      return { x: p.x, y: p.y }
+      const rect = svg.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return { x: 0, y: 0 }
+      const scale = Math.min(rect.width / BOARD_W, rect.height / BOARD_H)
+      const offsetX = (rect.width - BOARD_W * scale) / 2
+      const offsetY = (rect.height - BOARD_H * scale) / 2
+      return {
+        x: (clientX - rect.left - offsetX) / scale,
+        y: (clientY - rect.top - offsetY) / scale,
+      }
     },
     [svgRef],
   )
@@ -136,11 +149,9 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     const state = useBoardStore.getState()
     const boardPoint = clampPoint(clientToBoard(e.clientX, e.clientY))
 
-    // 中ボタン／Alt ドラッグはいつでもパン
-    if (e.button === 1 || e.altKey) {
-      gestureRef.current = { kind: 'pan', lastX: e.clientX, lastY: e.clientY }
-      return
-    }
+    // 盤面（コート）自体はドラッグでは動かさない仕様のため、中ボタン／Alt
+    // ドラッグでのパンは行わない（無視する）
+    if (e.button === 1) return
 
     if (state.tool === 'select') {
       const handle = (e.target as Element).closest('[data-handle]')
@@ -160,7 +171,6 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
         gestureRef.current = { kind: 'move', ref, last: boardPoint }
       } else {
         state.setSelection(null)
-        gestureRef.current = { kind: 'pan', lastX: e.clientX, lastY: e.clientY }
       }
       return
     }
@@ -178,11 +188,6 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
         return
       }
       state.addCharacter(state.pendingCharacterId, boardPoint)
-      return
-    }
-
-    if (state.tool === 'ball') {
-      state.addBall(boardPoint)
       return
     }
 
@@ -244,18 +249,6 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
       const bx = (gesture.startMid.x - gesture.startPan.x) / gesture.startZoom
       const by = (gesture.startMid.y - gesture.startPan.y) / gesture.startZoom
       state.setView({ zoom, panX: mid.x - bx * zoom, panY: mid.y - by * zoom })
-      return
-    }
-
-    if (gesture.kind === 'pan') {
-      const prev = clientToView(gesture.lastX, gesture.lastY)
-      const now = clientToView(e.clientX, e.clientY)
-      state.setView({
-        panX: state.view.panX + (now.x - prev.x),
-        panY: state.view.panY + (now.y - prev.y),
-      })
-      gesture.lastX = e.clientX
-      gesture.lastY = e.clientY
       return
     }
 
@@ -336,10 +329,6 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
       gestureRef.current = null
       setDraft(null)
     }
-    if (pointersRef.current.size === 1 && gesture?.kind === 'pinch') {
-      const [only] = [...pointersRef.current.values()]
-      gestureRef.current = { kind: 'pan', lastX: only.x, lastY: only.y }
-    }
   }
 
   const handleDoubleClick = (e: ReactMouseEvent<SVGSVGElement>) => {
@@ -351,19 +340,6 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
       if (item) setTextDialog({ point: { x: item.x, y: item.y }, value: item.text, id: item.id })
     }
   }
-
-  // ホイールでのズーム（passive:false で登録する必要があるため手動で addEventListener）
-  useEffect(() => {
-    const svg = svgRef.current
-    if (!svg) return
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault()
-      const v = clientToView(e.clientX, e.clientY)
-      useBoardStore.getState().zoomAt(Math.exp(-e.deltaY * 0.0016), v.x, v.y)
-    }
-    svg.addEventListener('wheel', onWheel, { passive: false })
-    return () => svg.removeEventListener('wheel', onWheel)
-  }, [clientToView, svgRef])
 
   const transform = `translate(${view.panX} ${view.panY}) scale(${view.zoom})`
 
