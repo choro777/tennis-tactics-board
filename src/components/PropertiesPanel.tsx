@@ -56,8 +56,7 @@ export function PropertiesPanel() {
         <Section title="操作のヒント">
           <ul className="list-disc space-y-1 pl-4 text-xs leading-relaxed text-slate-400">
             <li>オブジェクトをタップで選択、ドラッグで移動</li>
-            <li>何もない所をドラッグで盤面を移動（パン）</li>
-            <li>ホイール／ピンチで拡大縮小</li>
+            <li>ピンチ／右下の＋－ボタンで拡大縮小</li>
             <li>Delete / BackSpace で削除</li>
             <li>テキストはダブルクリックで編集</li>
           </ul>
@@ -69,11 +68,6 @@ export function PropertiesPanel() {
             キャラクターの上からドラッグすると、その位置を始点に移動矢印を引けます。
             配球（色付きの実線）とは別のオブジェクトです。
           </p>
-        </Section>
-      )}
-      {!selection && tool === 'ball' && (
-        <Section title="ボール">
-          <p className="text-xs leading-relaxed text-slate-400">コートをタップするとボールを置けます。</p>
         </Section>
       )}
       {!selection && tool === 'eraser' && (
