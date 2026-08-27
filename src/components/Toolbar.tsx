@@ -5,7 +5,6 @@ import { ToolIcon } from './ToolIcon'
 export const TOOLS: { tool: Tool; label: string }[] = [
   { tool: 'select', label: '選択' },
   { tool: 'character', label: 'キャラ' },
-  { tool: 'ball', label: 'ボール' },
   { tool: 'shot', label: '配球' },
   { tool: 'movement', label: '移動' },
   { tool: 'pen', label: 'ペン' },
