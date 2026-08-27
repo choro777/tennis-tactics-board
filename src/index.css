@@ -1,13 +1,23 @@
 @import 'tailwindcss';
 
-html,
-body,
-#root {
+/*
+ * スマホでコートをドラッグ／ピンチ操作したときに、ブラウザ側の
+ * ページスクロールや拡大縮小が一緒に反応しないようにする。
+ * html/body を viewport ちょうどのサイズに固定してページ自体を
+ * 動かなくし、内部のスクロールが必要な場所（キャラ一覧など）だけ
+ * 個別に overflow-y: auto を効かせる構成にしている。
+ */
+html {
   height: 100%;
+  overflow: hidden;
 }
 
 body {
+  position: fixed;
+  inset: 0;
+  height: 100%;
   margin: 0;
+  overflow: hidden;
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
   font-family:
@@ -20,12 +30,21 @@ body {
     sans-serif;
 }
 
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
 /* キャンバス上ではブラウザ既定のスクロール／ズームを止め、
    ポインタ操作をすべてアプリ側で処理する */
 .board-surface {
   touch-action: none;
   -webkit-user-select: none;
   user-select: none;
+  /* iOS Safari は長押しで「コピー」等のコールアウトメニューを出そうとする。
+     これがドラッグ中に割り込むと、指を離した扱いになったり座標がおかしく
+     なったりすることがあるため無効化しておく。 */
+  -webkit-touch-callout: none;
 }
 
 .no-scrollbar::-webkit-scrollbar {
