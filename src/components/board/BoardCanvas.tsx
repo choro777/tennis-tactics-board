@@ -26,8 +26,12 @@ type Gesture =
   | { kind: 'pinch'; startDist: number; startZoom: number; startMid: Point; startPan: Point }
   | { kind: 'move'; ref: SelectionRef; last: Point }
   | { kind: 'endpoint'; ref: SelectionRef; which: 'start' | 'end' }
-  | { kind: 'shot'; start: Point }
-  | { kind: 'movement'; start: Point; characterId: string }
+  // `last` はドラッグ中に毎回 pointermove 側で直接書き換える「最後に成功した終点」。
+  // React の state（draft）越しに読むと、同期的に立て続けにイベントが来たときに
+  // 再レンダーがまだ反映されておらず古い値を掴んでしまうことがあるため、
+  // ref（gestureRef.current 自体）に直接持たせて常に最新値を参照できるようにする。
+  | { kind: 'shot'; start: Point; last: Point }
+  | { kind: 'movement'; start: Point; characterId: string; last: Point }
   | { kind: 'draw'; drawing: Omit<Drawing, 'id'> }
   | { kind: 'erase' }
 
@@ -41,6 +45,14 @@ const DRAG_THRESHOLD = 0.02
 
 const DRAW_TOOLS: DrawingType[] = ['pen', 'arrow', 'line', 'circle', 'rectangle']
 
+/**
+ * 実機（特にSafari）でしか再現しない座標バグの調査用。
+ * URL に `?debug` を付けたときだけ、画面上部にポインタ座標の生ログを
+ * 表示する。通常利用には一切影響しない。
+ */
+const DEBUG_TOUCH =
+  typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug')
+
 export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
   const scene = useBoardStore((s) => s.scene)
   const tool = useBoardStore((s) => s.tool)
@@ -52,6 +64,28 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
   const [draft, setDraft] = useState<Draft | null>(null)
   const [textDialog, setTextDialog] = useState<{ point: Point; value: string; id?: string } | null>(
     null,
+  )
+  const [debugLog, setDebugLog] = useState<string[]>([])
+  // clientToBoard は後で定義するため、ref 経由で参照する
+  const clientToBoardRef = useRef<((x: number, y: number) => Point | null) | null>(null)
+
+  const logDebug = useCallback(
+    (label: string, e: { pointerId: number; pointerType: string; isPrimary: boolean; clientX: number; clientY: number }) => {
+      if (!DEBUG_TOUCH) return
+      const svg = svgRef.current
+      const rect = svg?.getBoundingClientRect()
+      const board = clientToBoardRef.current?.(e.clientX, e.clientY)
+      const vv = window.visualViewport
+      const line =
+        `${label} id=${e.pointerId} type=${e.pointerType} primary=${e.isPrimary} ` +
+        `client=(${e.clientX.toFixed(1)},${e.clientY.toFixed(1)}) ` +
+        `rect=${rect ? `${rect.width.toFixed(1)}x${rect.height.toFixed(1)}@(${rect.left.toFixed(1)},${rect.top.toFixed(1)})` : 'null'} ` +
+        `board=${board ? `(${board.x.toFixed(3)},${board.y.toFixed(3)})` : 'NULL!'} ` +
+        `pointers=${pointersRef.current.size} ` +
+        `vv=${vv ? `scale=${vv.scale.toFixed(2)} off=(${vv.offsetLeft.toFixed(1)},${vv.offsetTop.toFixed(1)})` : 'n/a'}`
+      setDebugLog((prev) => [...prev.slice(-24), line])
+    },
+    [svgRef],
   )
 
   const interactive = tool === 'select' || tool === 'eraser'
@@ -96,6 +130,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     },
     [clientToView],
   )
+  clientToBoardRef.current = clientToBoard
 
   const findCharacterNear = useCallback((p: Point): string => {
     const { scene: current } = useBoardStore.getState()
@@ -144,6 +179,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     if (!svg) return
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     svg.setPointerCapture(e.pointerId)
+    logDebug('down', e)
 
     if (pointersRef.current.size === 2) {
       startPinch()
@@ -202,7 +238,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     }
 
     if (state.tool === 'shot') {
-      gestureRef.current = { kind: 'shot', start: boardPoint }
+      gestureRef.current = { kind: 'shot', start: boardPoint, last: boardPoint }
       setDraft({ kind: 'shot', start: boardPoint, end: boardPoint })
       return
     }
@@ -215,7 +251,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
             return { x: c.x, y: c.y }
           })()
         : boardPoint
-      gestureRef.current = { kind: 'movement', start, characterId }
+      gestureRef.current = { kind: 'movement', start, characterId, last: start }
       setDraft({ kind: 'movement', start, end: start, characterId })
       return
     }
@@ -245,6 +281,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     if (!pointersRef.current.has(e.pointerId)) return
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     const gesture = gestureRef.current
+    logDebug(`move gesture=${gesture?.kind ?? 'none'}`, e)
     if (!gesture) return
     const state = useBoardStore.getState()
 
@@ -287,11 +324,16 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     }
 
     if (gesture.kind === 'shot') {
+      // ref を直接書き換える（React の再レンダーを待たない）。
+      // pointerup/pointercancel がこの直後に同期的に来ても、確定処理は
+      // このステートではなく gesture.last（ref側）を見るので取りこぼさない。
+      gesture.last = boardPoint
       setDraft({ kind: 'shot', start: gesture.start, end: boardPoint })
       return
     }
 
     if (gesture.kind === 'movement') {
+      gesture.last = boardPoint
       setDraft({
         kind: 'movement',
         start: gesture.start,
@@ -313,20 +355,33 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     }
   }
 
-  const finishGesture = (e: ReactPointerEvent<SVGSVGElement>) => {
-    pointersRef.current.delete(e.pointerId)
-    const gesture = gestureRef.current
+  /**
+   * ドラッグ確定処理の共通部分。
+   *
+   * `endRaw` に「そのポインタイベント自身の座標から計算した終点」を渡すか、
+   * `null`（＝使わない）を渡すかは呼び出し側が決める。pointercancel は
+   * 渡さない ―― 一部のブラウザ（特にSafari）は pointercancel の
+   * clientX/clientY を 0 で送ってくることがあり、そのまま使うと
+   * 「盤面の左上に矢印が飛ぶ」不具合になるため。その場合は代わりに
+   * 直前まで pointermove で更新し続けていた `gesture.last`（ref）を使う。
+   *
+   * 注意: フォールバック先は React の state（draft）ではなく gesture.last
+   * にすること。pointerdown → pointermove → pointerup/cancel が実ブラウザの
+   * イベントループを介さず同期的に立て続けに発生するケース（Safari の
+   * ジェスチャー割り込みなど）では、setDraft による再レンダーがまだ
+   * 反映されておらず、draft を読むと1つ前の（古い）値を掴んでしまう。
+   * gestureRef.current 自体に直接書き込む last は常に最新なので安全。
+   */
+  const commitGesture = (gesture: Gesture, endRaw: Point | null) => {
     const state = useBoardStore.getState()
-
-    if (gesture && (gesture.kind === 'shot' || gesture.kind === 'movement')) {
-      // 指を離した瞬間だけ座標変換に失敗した場合は、直前まで描画されていた
-      // プレビューの終点（＝最後に成功した座標）を使う。ここで諦めて
-      // gesture.start にフォールバックすると距離0になり「何も引かれない」
-      // 体験になってしまうため、それより自然な着地点を優先する。
-      const endRaw = clientToBoard(e.clientX, e.clientY)
-      const fallback =
-        draft && (draft.kind === 'shot' || draft.kind === 'movement') ? draft.end : gesture.start
-      const end = clampPoint(endRaw ?? fallback)
+    if (gesture.kind === 'shot' || gesture.kind === 'movement') {
+      const end = clampPoint(endRaw ?? gesture.last)
+      if (DEBUG_TOUCH) {
+        setDebugLog((prev) => [
+          ...prev.slice(-24),
+          `  -> commit end=${endRaw ? 'event' : 'fallback'} start=(${gesture.start.x.toFixed(3)},${gesture.start.y.toFixed(3)}) end=(${end.x.toFixed(3)},${end.y.toFixed(3)})`,
+        ])
+      }
       if (dist(gesture.start, end) >= DRAG_THRESHOLD) {
         if (gesture.kind === 'shot') {
           const s = state.shotSettings
@@ -337,7 +392,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
       }
     }
 
-    if (gesture && gesture.kind === 'draw') {
+    if (gesture.kind === 'draw') {
       const d = gesture.drawing
       const valid =
         d.type === 'pen'
@@ -345,7 +400,30 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
           : d.points.length > 1 && dist(d.points[0], d.points[1]) >= 0.008
       if (valid) state.addDrawing(d)
     }
+  }
 
+  /** pointerup: 指を離した位置を、成功すれば使う */
+  const finishGesture = (e: ReactPointerEvent<SVGSVGElement>) => {
+    logDebug(`up gesture=${gestureRef.current?.kind ?? 'none'}`, e)
+    pointersRef.current.delete(e.pointerId)
+    const gesture = gestureRef.current
+    if (gesture) commitGesture(gesture, clientToBoard(e.clientX, e.clientY))
+    if (pointersRef.current.size < 2) {
+      gestureRef.current = null
+      setDraft(null)
+    }
+  }
+
+  /**
+   * pointercancel: OSのジェスチャー（長押しコールアウト・エッジスワイプ等）
+   * に割り込まれた場合。イベント自体の座標は信用せず、直前のプレビュー
+   * 位置（フォールバック）で確定させる。
+   */
+  const cancelGesture = (e: ReactPointerEvent<SVGSVGElement>) => {
+    logDebug(`cancel gesture=${gestureRef.current?.kind ?? 'none'}`, e)
+    pointersRef.current.delete(e.pointerId)
+    const gesture = gestureRef.current
+    if (gesture) commitGesture(gesture, null)
     if (pointersRef.current.size < 2) {
       gestureRef.current = null
       setDraft(null)
@@ -374,7 +452,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={finishGesture}
-        onPointerCancel={finishGesture}
+        onPointerCancel={cancelGesture}
         onDoubleClick={handleDoubleClick}
       >
         <BoardDefs />
@@ -394,6 +472,33 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
       </svg>
 
       <ZoomControls />
+
+      {DEBUG_TOUCH && (
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-50 max-h-[45%] overflow-y-auto bg-black/85 p-2 font-mono text-[9px] leading-tight text-lime-300">
+          <div className="pointer-events-auto mb-1 flex gap-2">
+            <button
+              type="button"
+              className="rounded bg-white/20 px-2 py-0.5 text-white"
+              onClick={() => setDebugLog([])}
+            >
+              クリア
+            </button>
+            <button
+              type="button"
+              className="rounded bg-white/20 px-2 py-0.5 text-white"
+              onClick={() => {
+                const text = debugLog.join('\n')
+                if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).catch(() => undefined)
+              }}
+            >
+              コピー
+            </button>
+          </div>
+          {debugLog.map((line, i) => (
+            <div key={i}>{line}</div>
+          ))}
+        </div>
+      )}
 
       {textDialog && (
         <TextInputDialog
