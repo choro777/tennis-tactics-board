@@ -104,7 +104,6 @@ export interface SelectionRef {
 export type Tool =
   | 'select'
   | 'character'
-  | 'ball'
   | 'shot'
   | 'movement'
   | 'pen'
