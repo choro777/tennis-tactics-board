@@ -63,15 +63,18 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
    * レイアウト直後などに一時的に null を返すことがあり、その際の
    * フォールバック（0,0）に座標が飛ぶことで「配球を押すと左上にカーソルが
    * 行ってしまう」ような不具合につながっていた。
-   * `getBoundingClientRect()` は null を返さないため、こちらを使い
-   * `preserveAspectRatio="xMidYMid meet"` のレターボックス分を自前で計算する。
+   * `getBoundingClientRect()` に変更した後も、レイアウトが確定する前の
+   * ごく短い間は `rect` のサイズが 0 になり得るため、そのケースでは
+   * 「(0,0) 扱いにする」のではなく `null` を返す。呼び出し側は null の
+   * ときはその座標を一切使わず、その回のポインタ操作を無視する
+   * （＝誤った位置で確定させるより、その一瞬だけ操作を取りこぼす方が安全）。
    */
   const clientToView = useCallback(
-    (clientX: number, clientY: number): Point => {
+    (clientX: number, clientY: number): Point | null => {
       const svg = svgRef.current
-      if (!svg) return { x: 0, y: 0 }
+      if (!svg) return null
       const rect = svg.getBoundingClientRect()
-      if (rect.width <= 0 || rect.height <= 0) return { x: 0, y: 0 }
+      if (rect.width <= 0 || rect.height <= 0) return null
       const scale = Math.min(rect.width / BOARD_W, rect.height / BOARD_H)
       const offsetX = (rect.width - BOARD_W * scale) / 2
       const offsetY = (rect.height - BOARD_H * scale) / 2
@@ -85,8 +88,9 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
 
   /** クライアント座標 → 正規化座標（ズーム／パンを考慮） */
   const clientToBoard = useCallback(
-    (clientX: number, clientY: number): Point => {
+    (clientX: number, clientY: number): Point | null => {
       const v = clientToView(clientX, clientY)
+      if (!v) return null
       const { zoom, panX, panY } = useBoardStore.getState().view
       return { x: (v.x - panX) / zoom / BOARD_W, y: (v.y - panY) / zoom / BOARD_H }
     },
@@ -123,6 +127,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     if (pts.length < 2) return
     const a = clientToView(pts[0].x, pts[0].y)
     const b = clientToView(pts[1].x, pts[1].y)
+    if (!a || !b) return
     const state = useBoardStore.getState()
     gestureRef.current = {
       kind: 'pinch',
@@ -146,12 +151,17 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     }
     if (pointersRef.current.size > 2) return
 
-    const state = useBoardStore.getState()
-    const boardPoint = clampPoint(clientToBoard(e.clientX, e.clientY))
-
     // 盤面（コート）自体はドラッグでは動かさない仕様のため、中ボタン／Alt
     // ドラッグでのパンは行わない（無視する）
     if (e.button === 1) return
+
+    const boardPointRaw = clientToBoard(e.clientX, e.clientY)
+    // 座標変換がまだできない場合（レイアウト確定前など）はこの操作を無視する。
+    // (0,0) 等にフォールバックさせないことで「左上に飛ぶ」不具合を防ぐ。
+    if (!boardPointRaw) return
+    const boardPoint = clampPoint(boardPointRaw)
+
+    const state = useBoardStore.getState()
 
     if (state.tool === 'select') {
       const handle = (e.target as Element).closest('[data-handle]')
@@ -243,6 +253,7 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
       if (pts.length < 2) return
       const a = clientToView(pts[0].x, pts[0].y)
       const b = clientToView(pts[1].x, pts[1].y)
+      if (!a || !b) return
       const d = Math.hypot(b.x - a.x, b.y - a.y) || 1
       const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
       const zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, (gesture.startZoom * d) / gesture.startDist))
@@ -252,7 +263,10 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
       return
     }
 
-    const boardPoint = clampPoint(clientToBoard(e.clientX, e.clientY))
+    const boardPointRaw = clientToBoard(e.clientX, e.clientY)
+    // 変換できない一瞬だけ移動を無視する（直前の描画状態をそのまま保持する）
+    if (!boardPointRaw) return
+    const boardPoint = clampPoint(boardPointRaw)
 
     if (gesture.kind === 'move') {
       state.translateObject(gesture.ref, boardPoint.x - gesture.last.x, boardPoint.y - gesture.last.y)
@@ -305,7 +319,14 @@ export function BoardCanvas({ svgRef }: { svgRef: RefObject<SVGSVGElement> }) {
     const state = useBoardStore.getState()
 
     if (gesture && (gesture.kind === 'shot' || gesture.kind === 'movement')) {
-      const end = clampPoint(clientToBoard(e.clientX, e.clientY))
+      // 指を離した瞬間だけ座標変換に失敗した場合は、直前まで描画されていた
+      // プレビューの終点（＝最後に成功した座標）を使う。ここで諦めて
+      // gesture.start にフォールバックすると距離0になり「何も引かれない」
+      // 体験になってしまうため、それより自然な着地点を優先する。
+      const endRaw = clientToBoard(e.clientX, e.clientY)
+      const fallback =
+        draft && (draft.kind === 'shot' || draft.kind === 'movement') ? draft.end : gesture.start
+      const end = clampPoint(endRaw ?? fallback)
       if (dist(gesture.start, end) >= DRAG_THRESHOLD) {
         if (gesture.kind === 'shot') {
           const s = state.shotSettings
